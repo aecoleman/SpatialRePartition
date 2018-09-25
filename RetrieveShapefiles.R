@@ -1,4 +1,4 @@
-# Get PUMA Shapes
+# Get Shapes
 # 
 # Author: Andrew Coleman
 
@@ -10,6 +10,14 @@ library(tigris)
 library(parallel)
 library(pbapply)
 library(acs)
+
+# Define parameters ----
+
+dirpath <- 'D:/Shapefiles/TIGRIS'
+
+year <- 2016
+
+# Define functions ----
 
 ReadyCluster <- function(n){
   
@@ -26,13 +34,25 @@ ReadyCluster <- function(n){
 
 SaveShapeCBSA <- function(save.dir, year){
   
-  shp.cbsa.us <- core_based_statistical_areas(year = year, 
+  shp.cbsa.us <- tigris::core_based_statistical_areas(year = year, 
                                               class = 'sf')
   
   st_write( shp.cbsa.us, 
             file.path(save.dir, 
                       sprintf('TL_%04.0f_US_CBSA.gpkg', 
                               year) ) )
+  
+}
+
+SaveShapeCongressionalDistrict <- function(save.dir, year){
+  
+  shp.codi.us <- tigris::congressional_districts(year = year, class = 'sf')
+  
+  st_write( shp.codi.us, 
+            file.path(save.dir, 
+                      sprintf('TL_%04.0f_US_CONGRESSIONAL_DISTRICTS.gpkg', 
+                              year) ) )
+  
   
 }
 
@@ -49,7 +69,7 @@ SaveShapePUMA <- function(save.dir, year, cores){
                             
                               out <- try( 
                                   st_cast(
-                                    pumas( state = fips.state$STATE[x],
+                                    tigris::pumas( state = fips.state$STATE[x],
                                            year = year,
                                            class = 'sf' ),
                                     'MULTIPOLYGON'),
@@ -58,9 +78,14 @@ SaveShapePUMA <- function(save.dir, year, cores){
                               if( identical( class(out), c('sf', 'data.frame') ) ){
                                 
                                 file.nm.puma <- file.path(save.dir, 
+                                                          fips.state$STUSAB[x], 
                                                           sprintf('TL_%04.0f_%s_PUMA.gpkg', 
                                                                   year, 
                                                                   fips.state$STUSAB[x]) )
+                                
+                                if( !dir.exists( dirname( file.nm.puma ) ) ){
+                                  dir.create(dirname( file.nm.puma ) ) 
+                                }
                                 
                                 st_write( out, file.nm.puma )
                                 
@@ -81,18 +106,64 @@ SaveShapePUMA <- function(save.dir, year, cores){
   
 }
 
-.SaveShapeForState <- function(what, save.dir, year, cores, state.fips){
+.SaveShapeForStateGet <- function(what, save.dir, year, cores, file.nm, fun.nm, fips.county, geom.type){
+ 
+  if(missing(cores)){ cores <- detectCores() - 1L }
   
-  if( what == 'AWATER' ){
-    fun.nm <- 'area_water'
-    geom.type <- 'MULTIPOLYGON'
-  } else if ( what == 'ROADS' ){
-    fun.nm <- 'roads'
-    geom.type <- 'MULTILINESTRING'
-  } else if ( what == 'TRACTS' ){
-    fun.nm <- 'tracts'
-    geom.type <- 'MULTIPOLYGON'
+  stopifnot(dir.exists(save.dir))
+  
+  cl <- ReadyCluster(n = cores)
+  
+  shp.county.list <- 
+    parLapplyLB(cl = cl,
+                 X = seq(nrow(fips.county)), 
+               fun = function(x){ 
+                   
+                   dt <- try( 
+                     st_cast(
+                       do.call( fun.nm, 
+                                args = list('state' = fips.county$State.ANSI[x],
+                                            'county' = fips.county$County.ANSI[x],
+                                            'cb' = TRUE,
+                                            'year' = year,
+                                            'class' = 'sf') ),
+                       geom.type),
+                     silent = TRUE) 
+                   
+                   return(dt)
+                     
+                 }
+    )
+  
+  stopCluster(cl)
+  
+  if( length( shp.county.list ) > 1 ){
+    
+    shp.state.dt <- do.call('rbind', shp.county.list)
+    
+  } else {
+    
+    shp.state.dt <- shp.county.list[[1]]
+    
   }
+  
+  rm(shp.county.list)
+  
+  
+  if( 'geometry' %in% names( shp.state.dt) & !file.exists(file.nm) ){
+    
+    st_write( shp.state.dt, file.nm )
+    
+    return(file.nm)
+    
+  } else {
+    
+    return(NULL)
+  }
+
+}
+
+.SaveShapeForState <- function(what, save.dir, year, cores, state.fips){
   
   if( is.character( state.fips ) ){
     
@@ -112,62 +183,41 @@ SaveShapePUMA <- function(save.dir, year, cores){
     fips.county <- acs::fips.county[fips.county$State.ANSI == state.fips,]
   }
   
-  if(missing(cores)){ cores <- detectCores() - 1L }
-  
-  stopifnot(dir.exists(save.dir))
-  
-  cl <- ReadyCluster(n = cores)
-  
-  shp.county.list <- parLapplyLB(cl = cl,
-                                 X = seq(nrow(fips.county)), 
-                                 fun = function(x){ 
-                                   
-                                   dt <- try( 
-                                     data.table(
-                                       st_cast(
-                                         do.call( fun.nm, 
-                                                  args = list('state' = fips.county$State.ANSI[x],
-                                                     'county' = fips.county$County.ANSI[x],
-                                                     'cb' = TRUE,
-                                                     'year' = year,
-                                                     'class' = 'sf' ) ),
-                                         geom.type) ),
-                                     silent = TRUE) 
-                                   
-                                   if( identical( class(dt), c('data.table', 'data.frame') ) ){
-                                     
-                                     return(dt)
-                                     
-                                   } else {
-                                     
-                                     return(NULL)
-                                     
-                                   }
-                                 })
-  
-  stopCluster(cl)
-  
-  shp.state.dt <- rbindlist(shp.county.list)
+
   
   file.nm <- 
     file.path( 
       save.dir,
+      fips.county$State[1],
       sprintf('TL_%04.0f_%s_%s.gpkg', 
               year, 
               fips.county$State[1],
               what) )
   
-  if( 'geometry' %in% names( shp.state.dt) ){
-    
-    st_write( st_as_sf(shp.state.dt), file.nm )
-    
-    return(file.nm)
-  
-  } else {
-    
-    return(NULL)
+  if( !dir.exists( dirname(file.nm) ) ){
+    dir.create(  dirname(file.nm) )
   }
   
+  if( what == 'AWATER' ){
+    fun.nm <- 'area_water'
+    geom.type <- 'MULTIPOLYGON'
+  } else if ( what == 'ROADS' ){
+    fun.nm <- 'roads'
+    geom.type <- 'MULTILINESTRING'
+  } else if ( what == 'TRACTS' ){
+    fun.nm <- 'tracts'
+    geom.type <- 'MULTIPOLYGON'
+  }
+  
+  if( !file.exists(file.nm) ){
+    
+    return( .SaveShapeForStateGet(what, save.dir, year, cores, file.nm, fun.nm, fips.county, geom.type) )
+    
+  } else {
+  
+    return( NULL )
+    
+  }
 }
 
 SaveShapeByState <- function(what, save.dir, year, cores){
@@ -192,15 +242,11 @@ SaveShapeByState <- function(what, save.dir, year, cores){
   
 }
 
-# Script ----
-
-dirpath <- 'D:/Shapefiles/TIGRIS'
-
-year <- 2016
+# Get Shapefiles ----
 
 pumas <- SaveShapePUMA(save.dir = dirpath, year = year)
 
-roads <- SaveShapeByState(what = 'ROADS', save.dir = dirpath, year = year)
+# roads <- SaveShapeByState(what = 'ROADS', save.dir = dirpath, year = year)
 
 awater <- SaveShapeByState(what = 'AWATER', save.dir = dirpath, year = year)
 
@@ -208,4 +254,3 @@ tracts <- SaveShapeByState(what = 'TRACTS', save.dir = dirpath, year = year)
 
 cbsa <- SaveShapeCBSA(save.dir = dirpath, year = year)
 
-# Change Roads to State Level ----
